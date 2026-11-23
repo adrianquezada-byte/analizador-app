@@ -1,4 +1,4 @@
 streamlit
-yfinance
+tiingo
 openai
 curl_cffi
