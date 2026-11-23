@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 from openai import OpenAI
+from curl_cffi import requests as curl_requests
 
 # Configurar la página
 st.set_page_config(page_title="Análisis de Acciones", page_icon="📈")
@@ -20,46 +21,55 @@ if analizar_btn:
     else:
         with st.spinner(f"Obteniendo datos de {ticker}..."):
             try:
-                # 1. Obtener datos
-                stock = yf.Ticker(ticker)
-                info = stock.info
+                # 1. Obtener datos usando curl_cffi para simular un navegador
+                session = curl_requests.Session(impersonate="chrome")
+                stock = yf.Ticker(ticker, session=session)
                 
-                # Validar que el ticker exista
-                if 'currentPrice' not in info and 'regularMarketPrice' not in info:
-                    st.error(f"No se encontraron datos para {ticker}. Verifica el ticker.")
+                # Validar usando history() (más fiable que info en la nube)
+                hist = stock.history(period="1d")
+                if hist.empty:
+                    st.error(f"No se encontraron datos para {ticker}. Verifica el ticker o intenta de nuevo en unos segundos.")
                     st.stop()
 
+                # Obtener precio de cierre
+                precio_actual = hist['Close'].iloc[-1]
+
+                # Intentar obtener info
+                try:
+                    info = stock.info
+                except Exception:
+                    info = {}
+
                 datos_clave = {
-                    "precio_actual": info.get("currentPrice", info.get("regularMarketPrice")),
-                    "capitalización": info.get("marketCap"),
-                    "PER": info.get("trailingPE"),
-                    "PER_forward": info.get("forwardPE"),
-                    "máximo_52_semanas": info.get("fiftyTwoWeekHigh"),
-                    "mínimo_52_semanas": info.get("fiftyTwoWeekLow"),
-                    "margen_beneficio": info.get("profitMargins"),
-                    "ingresos_totales": info.get("totalRevenue"),
-                    "recomendación_analistas": info.get("recommendationKey"),
-                    "precio_objetivo": info.get("targetMeanPrice"),
+                    "precio_actual": round(precio_actual, 2),
+                    "capitalización": info.get("marketCap", "N/A"),
+                    "PER": info.get("trailingPE", "N/A"),
+                    "PER_forward": info.get("forwardPE", "N/A"),
+                    "máximo_52_semanas": info.get("fiftyTwoWeekHigh", "N/A"),
+                    "mínimo_52_semanas": info.get("fiftyTwoWeekLow", "N/A"),
+                    "margen_beneficio": info.get("profitMargins", "N/A"),
+                    "ingresos_totales": info.get("totalRevenue", "N/A"),
+                    "recomendación_analistas": info.get("recommendationKey", "N/A"),
+                    "precio_objetivo": info.get("targetMeanPrice", "N/A"),
                 }
 
                 # Mostrar datos en la interfaz
                 st.subheader(f"Datos clave de {ticker}")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Precio Actual", f"${datos_clave['precio_actual']}")
-                col2.metric("PER (Trailing)", datos_clave['PER'])
+                col2.metric("PER (Trailing)", str(datos_clave['PER']))
                 col3.metric("Precio Objetivo (Analistas)", f"${datos_clave['precio_objetivo']}")
 
-                # 2. Llamar a OpenRouter (Modelo Gratuito)
+                # 2. Llamar a OpenRouter
                 with st.spinner("Analizando con IA (esto puede tardar unos segundos)..."):
                     
-                    # Configuramos el cliente apuntando a OpenRouter
                     client = OpenAI(
                         base_url="https://openrouter.ai/api/v1",
                         api_key=api_key,
                     )
                     
                     respuesta = client.chat.completions.create(
-                        model="openrouter/free", # Modelo gratuito
+                        model="meta-llama/llama-3-8b-instruct:free", 
                         messages=[
                             {"role": "system", "content": "Eres un analista financiero. Basándote en los datos proporcionados, analiza la acción en 3 puntos: puntos fuertes, riesgos y adecuación para inversores con tolerancia al riesgo media. No des recomendaciones directas de compra o venta. Sé breve y claro."},
                             {"role": "user", "content": f"Datos de {ticker}:\n{datos_clave}"}
@@ -70,5 +80,5 @@ if analizar_btn:
                     st.write(respuesta.choices[0].message.content)
 
             except Exception as e:
-                st.error(f"Ocurrió un error: {e}")
-                st.info("Si el error menciona 'Rate limit' o '429', significa que el modelo gratuito está saturado. Intenta de nuevo en unos segundos o cambia el modelo en el código a 'google/gemma-7b-it:free'.")
+                st.error(f"Ocurrió un error inesperado: {e}")
+                st.info("A veces Yahoo Finance bloquea las peticiones. Intenta recargar la página o prueba con otro ticker.")
