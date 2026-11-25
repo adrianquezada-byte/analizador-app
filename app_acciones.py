@@ -1,6 +1,7 @@
 import datetime as dt
 
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -47,8 +48,9 @@ def precio_intradia(ticker: str, token: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def historico_52s(ticker: str, token: str):
-    inicio = (dt.date.today() - dt.timedelta(days=365)).isoformat()
+def historico(ticker: str, token: str):
+    """~2 años de datos diarios: sirve para el rango de 52 semanas y para la MA 200."""
+    inicio = (dt.date.today() - dt.timedelta(days=730)).isoformat()
     data = tiingo_get(f"/tiingo/daily/{ticker}/prices", token, {"startDate": inicio})
     return pd.DataFrame(data)
 
@@ -120,6 +122,92 @@ def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list) -> 
     return consultar_ia(api_key, prompt, MODELO_IA + ":online")
 
 
+# ---------- Medias móviles ----------
+VENTANAS = [20, 50, 100, 200]
+COLORES = {"Precio": "#9aa0a6", "MA 20": "#f4b400", "MA 50": "#34a853", "MA 100": "#4285f4", "MA 200": "#ea4335"}
+
+
+def calcular_medias(close: pd.Series, tipo: str) -> pd.DataFrame:
+    out = pd.DataFrame({"Precio": close})
+    for n in VENTANAS:
+        if tipo == "SMA":
+            serie = close.rolling(n).mean()
+        else:
+            serie = close.ewm(span=n, adjust=False).mean()
+            serie.iloc[: n - 1] = float("nan")  # primeros valores poco fiables
+        out[f"MA {n}"] = serie
+    return out
+
+
+@st.fragment
+def seccion_medias(hist: pd.DataFrame, precio):
+    st.subheader("📊 Medias móviles")
+    tipo = st.radio(
+        "Tipo de media",
+        ["SMA", "EMA"],
+        horizontal=True,
+        help="SMA: media simple. EMA: exponencial, da más peso a los precios recientes y reacciona más rápido.",
+    )
+    col_precio = "adjClose" if "adjClose" in hist.columns else "close"
+    medias = calcular_medias(hist.set_index("date")[col_precio], tipo)
+    ultimo = medias.iloc[-1]
+    ref = precio or ultimo["Precio"]
+
+    # Gráfico (último año)
+    visible = medias[medias.index >= medias.index.max() - pd.Timedelta(days=365)]
+    fig = go.Figure()
+    for col in visible.columns:
+        fig.add_trace(go.Scatter(
+            x=visible.index, y=visible[col], name=col if col == "Precio" else col.replace("MA", tipo),
+            line=dict(color=COLORES[col], width=2.5 if col == "Precio" else 1.6),
+        ))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(fig)
+
+    # Tabla: precio vs cada media
+    filas, encima, validas = [], 0, 0
+    for n in VENTANAS:
+        v = ultimo[f"MA {n}"]
+        if pd.notna(v):
+            validas += 1
+            arriba = ref > v
+            encima += int(arriba)
+            filas.append({"Media": f"{tipo} {n}", "Valor": fmt_money(v),
+                          "Precio vs media": f"{(ref / v - 1) * 100:+.2f}%",
+                          "Posición": "🟢 Por encima" if arriba else "🔴 Por debajo"})
+        else:
+            filas.append({"Media": f"{tipo} {n}", "Valor": "N/D", "Precio vs media": "N/D",
+                          "Posición": "Sin datos suficientes"})
+    st.dataframe(pd.DataFrame(filas), hide_index=True)
+
+    # Lectura de la tendencia
+    if validas == len(VENTANAS) and encima == len(VENTANAS):
+        st.success("Precio por encima de las cuatro medias: tendencia generalmente **alcista**.")
+    elif validas == len(VENTANAS) and encima == 0:
+        st.error("Precio por debajo de las cuatro medias: tendencia generalmente **bajista**.")
+    else:
+        st.info(f"Señales mixtas: el precio está por encima de {encima} de {validas} medias.")
+
+    # Golden Cross / Death Cross (MA 50 vs MA 200)
+    d = (medias["MA 50"] - medias["MA 200"]).dropna()
+    if len(d) > 1:
+        positivo = d > 0
+        cambios = positivo != positivo.shift()
+        cambios.iloc[0] = False
+        estado = "MA 50 por encima de la MA 200 (configuración alcista)" if positivo.iloc[-1] \
+            else "MA 50 por debajo de la MA 200 (configuración bajista)"
+        if cambios.any():
+            fecha = cambios[cambios].index[-1]
+            nombre_cruce = "🟡 Golden Cross (alcista)" if positivo.loc[fecha] else "⚫ Death Cross (bajista)"
+            st.markdown(f"**Estado actual:** {estado}.  \n**Último cruce detectado:** {nombre_cruce} el {fecha:%d/%m/%Y}.")
+        else:
+            st.markdown(f"**Estado actual:** {estado}.  \nNo se detectaron cruces MA 50 / MA 200 en el período analizado.")
+
+    st.caption("Las medias se calculan con precios de cierre ajustados por splits y dividendos. "
+               "Son indicadores rezagados: describen la tendencia pasada, no garantizan el futuro.")
+
+
 # ---------- Interfaz ----------
 st.title("📈 Analizador de Acciones con IA")
 
@@ -142,7 +230,7 @@ if analizar:
         with st.spinner("Consultando datos de mercado..."):
             px = precio_intradia(ticker, tiingo_key)
             meta = metadatos(ticker, tiingo_key)
-            hist = historico_52s(ticker, tiingo_key)
+            hist = historico(ticker, tiingo_key)
             cap = market_cap(ticker, tiingo_key)
     except requests.HTTPError as e:
         codigo = e.response.status_code if e.response is not None else "?"
@@ -177,13 +265,15 @@ if analizar:
     c4.metric("Capitalización de mercado", fmt_cap(cap))
 
     if not hist.empty:
-        minimo, maximo = hist["low"].min(), hist["high"].max()
+        hist["date"] = pd.to_datetime(hist["date"]).dt.tz_localize(None)
+        ultimo_anio = hist[hist["date"] >= hist["date"].max() - pd.Timedelta(days=365)]
+        minimo, maximo = ultimo_anio["low"].min(), ultimo_anio["high"].max()
         st.markdown("**Rango de 52 semanas**")
         st.write(f"{fmt_money(minimo)}  —  {fmt_money(maximo)}")
         if precio and maximo > minimo:
             st.progress(min(max((precio - minimo) / (maximo - minimo), 0.0), 1.0))
-        hist["date"] = pd.to_datetime(hist["date"])
-        st.line_chart(hist.set_index("date")["close"], height=250)
+        st.divider()
+        seccion_medias(hist, precio)
 
     if cap is None:
         st.caption("ℹ️ La capitalización de mercado requiere el plan de fundamentales de Tiingo.")
