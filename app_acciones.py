@@ -11,6 +11,21 @@ TIINGO = "https://api.tiingo.com"
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 MODELO_IA = "openai/gpt-4o-mini"  # puedes cambiarlo por cualquier modelo de OpenRouter
 
+# Empresas disponibles en el desplegable (nombre -> ticker). Tiingo usa guion para clases de acciones (BRK-B).
+EMPRESAS = {
+    "NVIDIA (NVDA)": "NVDA",
+    "Microsoft (MSFT)": "MSFT",
+    "Alphabet (GOOGL)": "GOOGL",
+    "Amazon (AMZN)": "AMZN",
+    "SpaceX (SPCX)": "SPCX",
+    "Meta Platforms (META)": "META",
+    "Tesla (TSLA)": "TSLA",
+    "Broadcom (AVGO)": "AVGO",
+    "Eli Lilly (LLY)": "LLY",
+    "Berkshire Hathaway (BRK-B)": "BRK-B",
+}
+OTRO = "Otro ticker…"
+
 
 # ---------- Utilidades ----------
 def secret(nombre: str) -> str:
@@ -204,6 +219,9 @@ def seccion_medias(hist: pd.DataFrame, precio):
         else:
             st.markdown(f"**Estado actual:** {estado}.  \nNo se detectaron cruces MA 50 / MA 200 en el período analizado.")
 
+    else:
+        st.caption("No hay historial suficiente para evaluar el cruce MA 50 / MA 200.")
+
     st.caption("Las medias se calculan con precios de cierre ajustados por splits y dividendos. "
                "Son indicadores rezagados: describen la tendencia pasada, no garantizan el futuro.")
 
@@ -215,7 +233,11 @@ with st.sidebar:
     st.header("Configuración")
     tiingo_key = st.text_input("Tiingo API Key", type="password", value=secret("TIINGO_API_KEY"))
     openrouter_key = st.text_input("OpenRouter API Key", type="password", value=secret("OPENROUTER_API_KEY"))
-    ticker = st.text_input("Ticker de la acción", value="AAPL").strip().upper()
+    opcion = st.selectbox("Empresa", list(EMPRESAS) + [OTRO])
+    if opcion == OTRO:
+        ticker = st.text_input("Ticker personalizado", value="AAPL").strip().upper()
+    else:
+        ticker = EMPRESAS[opcion]
     analizar = st.button("Analizar Acción 🚀")
 
 if analizar:
@@ -272,6 +294,9 @@ if analizar:
         st.write(f"{fmt_money(minimo)}  —  {fmt_money(maximo)}")
         if precio and maximo > minimo:
             st.progress(min(max((precio - minimo) / (maximo - minimo), 0.0), 1.0))
+        if len(ultimo_anio) < 240:
+            st.caption(f"ℹ️ Solo hay {len(ultimo_anio)} sesiones de historial (listado reciente): "
+                       "el rango corresponde al período disponible y las medias largas pueden aparecer como N/D.")
         st.divider()
         seccion_medias(hist, precio)
 
