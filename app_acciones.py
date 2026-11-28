@@ -3,6 +3,7 @@ import re
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -188,6 +189,314 @@ def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, mod
     return consultar_ia(api_key, prompt, modelo)
 
 
+# ---------- Apertura: pre-market, futuros, resultados y estimación ----------
+ET = ZoneInfo("America/New_York")
+FINNHUB = "https://finnhub.io/api/v1"
+ETIQUETA_SESION = {
+    "pre": "🌅 Pre-market (4:00–9:30 ET)",
+    "regular": "🟢 Mercado abierto",
+    "post": "🌆 After-hours (16:00–20:00 ET)",
+    "cerrado": "🌙 Mercado cerrado",
+}
+MOMENTO = {"bmo": "antes de la apertura", "amc": "después del cierre", "dmh": "durante la sesión"}
+
+
+def sesion_mercado(ahora: dt.datetime) -> str:
+    """Sesión según la hora de Nueva York (no considera feriados)."""
+    if ahora.weekday() >= 5:
+        return "cerrado"
+    m = ahora.hour * 60 + ahora.minute
+    if 240 <= m < 570:
+        return "pre"
+    if 570 <= m < 960:
+        return "regular"
+    if 960 <= m < 1200:
+        return "post"
+    return "cerrado"
+
+
+def analizar_extendido(barras: pd.DataFrame, cierres: dict | None = None):
+    """A partir de barras de 5 min (con pre/post market) devuelve el cierre de la última sesión
+    regular y la actividad posterior. `cierres` (fecha -> cierre oficial) afina el cierre de referencia."""
+    if barras is None or barras.empty or "close" not in barras:
+        return None
+    b = barras.copy()
+    b["date"] = pd.to_datetime(b["date"], utc=True).dt.tz_convert(ET)
+    b = b.sort_values("date")
+    b = b[b["date"].dt.weekday < 5]
+    minutos = b["date"].dt.hour * 60 + b["date"].dt.minute
+    regulares = b[(minutos >= 570) & (minutos < 960)]
+    if regulares.empty:
+        return None
+    ultima = regulares.iloc[-1]
+    fecha_ref = ultima["date"].date()
+    cierre = float((cierres or {}).get(fecha_ref) or ultima["close"])
+    ext = b[b["date"] > ultima["date"]]
+    if "volume" in ext:
+        ext = ext[ext["volume"].fillna(0) > 0]
+    resultado = {"cierre_ref": cierre, "fecha_ref": fecha_ref, "ext_precio": None, "ext_hora": None,
+                 "ext_volumen": 0, "ext_barras": 0, "pct": None}
+    if not ext.empty:
+        resultado.update(
+            ext_precio=float(ext.iloc[-1]["close"]), ext_hora=ext.iloc[-1]["date"],
+            ext_volumen=int(ext["volume"].sum()) if "volume" in ext else 0, ext_barras=len(ext),
+            pct=(float(ext.iloc[-1]["close"]) / cierre - 1) * 100,
+        )
+    return resultado
+
+
+def calcular_beta(precios_accion: pd.Series, precios_mercado: pd.Series, n: int = 252):
+    r = pd.concat([precios_accion.pct_change(), precios_mercado.pct_change()], axis=1, join="inner").dropna().tail(n)
+    if len(r) < 40 or r.iloc[:, 1].var() <= 0:
+        return None
+    return float(r.iloc[:, 0].cov(r.iloc[:, 1]) / r.iloc[:, 1].var())
+
+
+def sigma_gap(hist: pd.DataFrame, n: int = 60):
+    """Desviación típica (en %) de la brecha apertura vs cierre previo en las últimas n sesiones."""
+    d = hist.sort_values("date")
+    ap = "adjOpen" if "adjOpen" in d else "open"
+    ci = "adjClose" if "adjClose" in d else "close"
+    g = (d[ap] / d[ci].shift(1) - 1).dropna().tail(n)
+    return float(g.std() * 100) if len(g) >= 20 else None
+
+
+def serie_cierres(df: pd.DataFrame) -> pd.Series:
+    col = "adjClose" if "adjClose" in df else "close"
+    idx = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None).dt.normalize()
+    return pd.Series(df[col].values, index=idx)
+
+
+def parsear_yahoo(j: dict):
+    res = j["chart"]["result"][0]
+    precio = res["meta"].get("regularMarketPrice")
+    cierres = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+    previo = cierres[-2] if len(cierres) >= 2 else res["meta"].get("chartPreviousClose")
+    if not precio or not previo:
+        return None
+    return {"precio": float(precio), "previo": float(previo), "pct": (float(precio) / float(previo) - 1) * 100}
+
+
+def dia_habil_previo(fecha: dt.date) -> dt.date:
+    f = fecha - dt.timedelta(days=1)
+    while f.weekday() >= 5:
+        f -= dt.timedelta(days=1)
+    return f
+
+
+def resumir_resultados(lista: list, hoy: dt.date):
+    """Devuelve (próximo reporte, último reporte ya publicado) a partir del calendario de Finnhub."""
+    items = sorted([x for x in lista if x.get("date")], key=lambda x: x["date"])
+    prox = next((x for x in items if x["date"] >= hoy.isoformat() and x.get("epsActual") is None), None)
+    ult = next((x for x in reversed(items) if x.get("epsActual") is not None), None)
+    return prox, ult
+
+
+def resultados_afectan_apertura(prox, ult, hoy: dt.date) -> bool:
+    """True si hubo (o habrá antes de abrir) un reporte de resultados que mueva la apertura de `hoy`."""
+    if ult and ult.get("date") == dia_habil_previo(hoy).isoformat() and ult.get("hour") == "amc":
+        return True
+    if ult and ult.get("date") == hoy.isoformat() and ult.get("hour") == "bmo":
+        return True
+    if prox and prox.get("date") == hoy.isoformat() and prox.get("hour") in ("bmo", "", None):
+        return True
+    return False
+
+
+def estimar_apertura(cierre, pct_pre, pre_fresco, pct_fut, beta, sigma, hay_resultados):
+    """Combina pre-market y futuros (ajustados por beta) en un precio de apertura sugerido."""
+    notas, componentes = [], []
+    implicito = None
+    if pct_fut is not None:
+        b = beta if beta is not None else 1.0
+        implicito = b * pct_fut
+        if beta is None:
+            notas.append("No hay historial suficiente para calcular la beta; se asumió 1,0.")
+    if pct_pre is not None and implicito is not None:
+        w = 0.7 if pre_fresco else 0.4
+        gap = w * pct_pre + (1 - w) * implicito
+        componentes = [("Pre-market de la acción", pct_pre, w), ("Futuros S&P 500 × beta", implicito, 1 - w)]
+    elif pct_pre is not None:
+        gap = pct_pre
+        componentes = [("Pre-market de la acción", pct_pre, 1.0)]
+    elif implicito is not None:
+        gap = implicito
+        componentes = [("Futuros S&P 500 × beta", implicito, 1.0)]
+    else:
+        gap = 0.0
+        notas.append("Sin datos de pre-market ni de futuros: la estimación es simplemente el cierre anterior.")
+    if pct_pre is not None and not pre_fresco:
+        notas.append("La última operación en pre-market tiene más de 30 minutos: puede estar desactualizada.")
+    if hay_resultados:
+        notas.append("Hay un reporte de resultados que afecta esta apertura: la incertidumbre es mayor.")
+
+    puntos = (2 if (pct_pre is not None and pre_fresco) else 1 if pct_pre is not None else 0) + (1 if pct_fut is not None else 0)
+    if hay_resultados:
+        puntos -= 1
+    confianza = "Alta" if puntos >= 3 else "Media" if puntos == 2 else "Baja"
+
+    precio = cierre * (1 + gap / 100)
+    rango = (precio * (1 - sigma / 100), precio * (1 + sigma / 100)) if sigma else None
+    return {"precio": precio, "gap": gap, "rango": rango, "confianza": confianza, "componentes": componentes, "notas": notas}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def barras_extendidas(ticker: str, token: str):
+    inicio = (dt.date.today() - dt.timedelta(days=6)).isoformat()
+    data = tiingo_get(f"/iex/{ticker}/prices", token,
+                      {"startDate": inicio, "resampleFreq": "5min", "afterHours": "true"})
+    return pd.DataFrame(data)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def futuro_yahoo(simbolo: str):
+    try:
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(simbolo)}",
+                         params={"range": "5d", "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        return parsear_yahoo(r.json())
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def calendario_resultados(ticker: str, key: str):
+    hoy = dt.date.today()
+    r = requests.get(f"{FINNHUB}/calendar/earnings", timeout=15, params={
+        "symbol": ticker.replace("-", "."), "from": (hoy - dt.timedelta(days=100)).isoformat(),
+        "to": (hoy + dt.timedelta(days=120)).isoformat(), "token": key})
+    r.raise_for_status()
+    return r.json().get("earningsCalendar", [])
+
+
+def seccion_apertura(ticker, tiingo_key, finnhub_key, hist, px):
+    st.subheader("🌅 Apertura: pre-market, futuros y estimación")
+    ahora = dt.datetime.now(ET)
+    hoy = ahora.date()
+    sesion = sesion_mercado(ahora)
+    st.caption(f"{ETIQUETA_SESION[sesion]} · Hora en Nueva York: {ahora:%d/%m/%Y %H:%M}")
+
+    if sesion == "regular":
+        st.info(f"El mercado ya está abierto. Apertura real de hoy: **{fmt_money(px.get('open'))}**. "
+                "La estimación de apertura se muestra entre las 16:00 y las 9:30 (hora de Nueva York) del día hábil siguiente.")
+        return
+
+    # 1) Pre / post market de la acción
+    ext = None
+    try:
+        cierres = {d.date(): c for d, c in zip(hist["date"], hist["close"])}
+        ext = analizar_extendido(barras_extendidas(ticker, tiingo_key), cierres)
+    except Exception:
+        pass
+    pre_fresco = bool(ext and ext["ext_hora"] is not None and (ahora - ext["ext_hora"]) <= dt.timedelta(minutes=30))
+    pct_pre = ext["pct"] if ext else None
+
+    nombre_sesion = "Pre-market" if sesion == "pre" else "After-hours / último extendido"
+    c1, c2, c3, c4 = st.columns(4)
+    if ext:
+        c1.metric("Cierre de referencia", fmt_money(ext["cierre_ref"]), f"{ext['fecha_ref']:%d/%m}", delta_color="off")
+        c2.metric(nombre_sesion, fmt_money(ext["ext_precio"]),
+                  f"{pct_pre:+.2f}%" if pct_pre is not None else None)
+        c3.metric("Volumen (IEX)", f"{ext['ext_volumen']:,}" if ext["ext_barras"] else "N/D")
+        c4.metric("Última operación (ET)", f"{ext['ext_hora']:%H:%M}" if ext["ext_hora"] is not None else "N/D")
+        if ext["ext_precio"] is None:
+            st.caption("Aún no hay operaciones en la sesión extendida desde el último cierre.")
+    else:
+        st.warning("No se pudieron obtener datos de pre-market de Tiingo (el plan o el ticker podrían no incluirlos).")
+    st.caption("ℹ️ Los datos extendidos de Tiingo provienen del mercado IEX, que representa una parte pequeña del volumen "
+               "total: úsalos como referencia, no como precio exacto.")
+
+    # 2) Futuros del S&P 500 y del Nasdaq 100 (con respaldo en ETF SPY / QQQ)
+    futuros = {"S&P 500": futuro_yahoo("ES=F"), "Nasdaq 100": futuro_yahoo("NQ=F")}
+    origen_fut = "Futuros E-mini (Yahoo Finance)"
+    if not any(futuros.values()):
+        origen_fut = "ETF SPY / QQQ en sesión extendida (respaldo, sin datos de futuros)"
+        for nombre, etf in (("S&P 500", "SPY"), ("Nasdaq 100", "QQQ")):
+            try:
+                a = analizar_extendido(barras_extendidas(etf, tiingo_key))
+                if a and a["pct"] is not None:
+                    futuros[nombre] = {"precio": a["ext_precio"], "previo": a["cierre_ref"], "pct": a["pct"]}
+            except Exception:
+                pass
+    st.markdown(f"**Mercado general** · _{origen_fut}_")
+    f1, f2 = st.columns(2)
+    for col, nombre in ((f1, "S&P 500"), (f2, "Nasdaq 100")):
+        d = futuros.get(nombre)
+        col.metric(nombre, f"{d['precio']:,.2f}" if d else "N/D", f"{d['pct']:+.2f}%" if d else None)
+    pct_fut = futuros["S&P 500"]["pct"] if futuros.get("S&P 500") else None
+
+    # 3) Calendario de resultados
+    st.markdown("**📅 Calendario de resultados**")
+    prox = ult = None
+    resultados_ok = False
+    if not finnhub_key:
+        st.info("Para ver el calendario de resultados agrega una clave gratuita de Finnhub (finnhub.io/register) "
+                "en la barra lateral o en Secrets como `FINNHUB_API_KEY`.")
+    else:
+        try:
+            prox, ult = resumir_resultados(calendario_resultados(ticker, finnhub_key), hoy)
+            resultados_ok = True
+        except Exception as e:
+            st.warning(f"No se pudo consultar el calendario de resultados: {e}")
+    if resultados_ok:
+        if prox:
+            est = f" · EPS estimado: ${prox['epsEstimate']:.2f}" if prox.get("epsEstimate") is not None else ""
+            st.write(f"**Próximo reporte:** {prox['date']} ({MOMENTO.get(prox.get('hour'), 'hora por confirmar')}){est}")
+        if ult:
+            act, est_ = ult.get("epsActual"), ult.get("epsEstimate")
+            sorpresa = f" ({(act / est_ - 1) * 100:+.1f}% vs estimado)" if act is not None and est_ else ""
+            ing = ""
+            if ult.get("revenueActual") is not None:
+                ing = f" · Ingresos: {fmt_cap(ult['revenueActual'])}"
+                if ult.get("revenueEstimate"):
+                    ing += f" (estimado {fmt_cap(ult['revenueEstimate'])})"
+            st.write(f"**Último reporte ({ult['date']}):** EPS ${act:.2f}"
+                     + (f" vs ${est_:.2f} estimado{sorpresa}" if est_ is not None else "") + ing)
+        if not prox and not ult:
+            st.caption("Sin reportes de resultados en el período consultado (por ejemplo, una empresa recién listada).")
+    hay_resultados = resultados_afectan_apertura(prox, ult, hoy) if resultados_ok else False
+
+    # 4) Estimación
+    st.markdown("**🎯 Precio de apertura sugerido**")
+    if not ext:
+        st.warning("Sin datos del cierre de referencia no se puede estimar la apertura.")
+        return
+    beta = sigma = None
+    try:
+        beta = calcular_beta(serie_cierres(hist), serie_cierres(historico("SPY", tiingo_key)))
+    except Exception:
+        pass
+    try:
+        sigma = sigma_gap(hist)
+    except Exception:
+        pass
+    est = estimar_apertura(ext["cierre_ref"], pct_pre, pre_fresco, pct_fut, beta, sigma, hay_resultados)
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Apertura estimada", fmt_money(est["precio"]), f"{est['gap']:+.2f}% vs cierre {fmt_money(ext['cierre_ref'])}")
+    e2.metric("Rango probable (±1σ)",
+              f"{fmt_money(est['rango'][0])} – {fmt_money(est['rango'][1])}" if est["rango"] else "N/D")
+    e3.metric("Confianza", est["confianza"])
+    if est["componentes"]:
+        st.dataframe(pd.DataFrame([{"Fuente": n, "Señal": f"{v:+.2f}%", "Peso": f"{w:.0%}"} for n, v, w in est["componentes"]]),
+                     hide_index=True)
+    if beta is not None:
+        st.caption(f"Beta de la acción frente al S&P 500 (1 año): {beta:.2f}")
+    for nota in est["notas"]:
+        st.warning(nota)
+    with st.expander("¿Cómo se calcula esta estimación?"):
+        st.markdown(
+            "- **Punto de partida:** el cierre oficial de la última sesión regular.\n"
+            "- **Pre-market:** variación de la acción en la sesión extendida frente a ese cierre.\n"
+            "- **Futuros:** variación de los futuros del S&P 500 multiplicada por la **beta** de la acción "
+            "(cuánto suele moverse respecto al mercado).\n"
+            "- **Combinación:** 70 % pre-market y 30 % futuros si el último dato es reciente (≤ 30 min); 40 % / 60 % si no.\n"
+            "- **Rango (±1σ):** desviación típica de las brechas de apertura de las últimas 60 sesiones.\n"
+            "- **Confianza:** sube con más fuentes frescas y baja si hay resultados o datos viejos.\n\n"
+            "Es una **estimación heurística**, no una predicción: la apertura real la fija la subasta de la bolsa."
+        )
+
+
 # ---------- Medias móviles ----------
 VENTANAS = [20, 50, 100, 200]
 COLORES = {"Precio": "#9aa0a6", "MA 20": "#f4b400", "MA 50": "#34a853", "MA 100": "#4285f4", "MA 200": "#ea4335"}
@@ -284,6 +593,10 @@ with st.sidebar:
     st.header("Configuración")
     tiingo_key = st.text_input("Tiingo API Key", type="password", value=secret("TIINGO_API_KEY"))
     openrouter_key = st.text_input("OpenRouter API Key", type="password", value=secret("OPENROUTER_API_KEY"))
+    finnhub_key = st.text_input(
+        "Finnhub API Key (opcional)", type="password", value=secret("FINNHUB_API_KEY"),
+        help="Gratuita en finnhub.io/register. Se usa para el calendario de resultados.",
+    )
     modelo_ia = st.text_input(
         "Modelo de IA (OpenRouter)",
         value=MODELO_IA,
@@ -353,6 +666,11 @@ if analizar:
         if len(ultimo_anio) < 240:
             st.caption(f"ℹ️ Solo hay {len(ultimo_anio)} sesiones de historial (listado reciente): "
                        "el rango corresponde al período disponible y las medias largas pueden aparecer como N/D.")
+        st.divider()
+        try:
+            seccion_apertura(ticker, tiingo_key, finnhub_key, hist, px)
+        except Exception as e:
+            st.warning(f"No se pudo calcular la sección de apertura: {e}")
         st.divider()
         seccion_medias(hist, precio)
 
