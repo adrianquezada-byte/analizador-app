@@ -135,25 +135,44 @@ def parsear_rss(contenido: bytes, horas: int = 24, limite: int = 15):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def noticias_google(ticker: str, nombre: str):
-    """Titulares de las últimas 24h desde Google News (RSS gratuito, sin clave)."""
+def noticias_google(ticker: str, nombre: str, horas: int = 24):
+    """Titulares desde Google News (RSS gratuito). Devuelve (noticias, diagnóstico)."""
     limpio = re.sub(r"\b(and|inc|corp|corporation|company|co|ltd|plc|holdings|class [a-z])\b\.?,?", "", nombre, flags=re.I)
-    consulta = f"{' '.join(limpio.split())} {ticker} stock when:1d"
-    url = f"https://news.google.com/rss/search?q={quote_plus(consulta)}&hl=en-US&gl=US&ceid=US:en"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        r.raise_for_status()
-        return parsear_rss(r.content)
-    except Exception:
-        return []
+    limpio = " ".join(limpio.split())
+    dias = max(1, round(horas / 24))
+    consultas = [f"{limpio} {ticker} stock", limpio, f"{ticker} stock"]
+    vistos, noticias, diag = set(), [], []
+    for q in dict.fromkeys(c for c in consultas if c.strip()):
+        url = (f"https://news.google.com/rss/search?q={quote_plus(q + f' when:{dias}d')}"
+               "&hl=en-US&gl=US&ceid=US:en")
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            encontradas = parsear_rss(r.content, horas=horas)
+            diag.append(f"«{q}»: {len(encontradas)} resultados")
+            for n in encontradas:
+                if n["title"].lower() not in vistos:
+                    vistos.add(n["title"].lower())
+                    noticias.append(n)
+        except Exception as e:
+            diag.append(f"«{q}»: error ({type(e).__name__}: {e})")
+        if len(noticias) >= 15:
+            break
+    noticias.sort(key=lambda n: n["publishedDate"], reverse=True)
+    return noticias[:15], diag
 
 
 def noticias_24h(ticker: str, nombre: str, token: str):
-    """Devuelve (noticias, fuente). Usa Tiingo si tu plan las incluye; si no, Google News."""
+    """Devuelve (noticias, fuente, diagnóstico, horas_usadas).
+    Tiingo si tu plan las incluye; si no, Google News (24 h y, si no hay nada, 7 días)."""
     n = noticias_tiingo(ticker, token)
     if n:
-        return n, "Tiingo"
-    return noticias_google(ticker, nombre), "Google News"
+        return n, "Tiingo", [], 24
+    noticias, diag = noticias_google(ticker, nombre, 24)
+    if noticias:
+        return noticias, "Google News", diag, 24
+    noticias, diag2 = noticias_google(ticker, nombre, 168)
+    return noticias, "Google News", diag + diag2, 168
 
 
 # ---------- IA (OpenRouter) ----------
@@ -173,14 +192,14 @@ def consultar_ia(api_key: str, prompt: str, modelo: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
-def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, modelo: str) -> str:
+def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, modelo: str, horas: int = 24) -> str:
     listado = "\n".join(
         f"- {n['title']} ({n.get('source', '')}, {n['publishedDate'][:16].replace('T', ' ')} UTC)"
         + (f": {n['description'][:300]}" if n.get("description") else "")
         for n in noticias
     )
     prompt = (
-        f"Estos son los titulares de las últimas 24 horas sobre {nombre} ({ticker}):\n{listado}\n\n"
+        f"Estos son los titulares de {'las últimas 24 horas' if horas <= 24 else 'los últimos 7 días'} sobre {nombre} ({ticker}):\n{listado}\n\n"
         "Resume en español, en 4 a 6 viñetas, lo más relevante para un inversionista, agrupando titulares "
         "que traten del mismo tema y mencionando la fuente entre paréntesis. Termina con una línea sobre el "
         "sentimiento general (positivo, neutral o negativo). Básate solo en los titulares: no inventes cifras ni "
@@ -561,6 +580,8 @@ def seccion_medias(hist: pd.DataFrame, precio):
         st.success("Precio por encima de las cuatro medias: tendencia generalmente **alcista**.")
     elif validas == len(VENTANAS) and encima == 0:
         st.error("Precio por debajo de las cuatro medias: tendencia generalmente **bajista**.")
+    elif validas == 0:
+        st.info("Todavía no hay historial suficiente (mínimo 20 sesiones) para calcular las medias móviles.")
     else:
         st.info(f"Señales mixtas: el precio está por encima de {encima} de {validas} medias.")
 
@@ -680,23 +701,30 @@ if analizar:
     st.divider()
     st.subheader("🗞️ Información relevante de las últimas 24 horas")
     with st.spinner("Buscando noticias..."):
-        noticias, fuente = noticias_24h(ticker, nombre, tiingo_key)
+        noticias, fuente, diag, horas_usadas = noticias_24h(ticker, nombre, tiingo_key)
 
     if not noticias:
-        st.info("No se encontraron noticias de las últimas 24 horas para esta acción.")
+        st.info("No se encontraron noticias recientes para esta acción.")
+        if diag:
+            with st.expander("Detalles de la búsqueda"):
+                st.write("\n".join(f"- {d}" for d in diag))
+                st.caption("Si todas las consultas dan error, Google News puede estar bloqueando el servidor de Streamlit.")
     else:
+        if horas_usadas > 24:
+            st.caption("ℹ️ No hubo titulares en las últimas 24 horas; se muestran los de los últimos 7 días.")
         resumen_ok = False
         if openrouter_key:
             try:
                 with st.spinner("Resumiendo con IA..."):
-                    st.markdown(resumen_noticias(openrouter_key, ticker, nombre, noticias, modelo_ia))
+                    st.markdown(resumen_noticias(openrouter_key, ticker, nombre, noticias, modelo_ia, horas_usadas))
                 resumen_ok = True
             except Exception as e:
                 st.error(f"No se pudo generar el resumen con IA: {e}")
         else:
             st.info("Ingresa tu OpenRouter API Key para ver un resumen con IA. Abajo tienes los titulares.")
 
-        with st.expander(f"Titulares de las últimas 24 horas ({fuente})", expanded=not resumen_ok):
+        ventana = "24 horas" if horas_usadas <= 24 else "7 días"
+        with st.expander(f"Titulares de los últimos {ventana} ({fuente})", expanded=not resumen_ok):
             for n in noticias:
                 hora = n["publishedDate"][:16].replace("T", " ")
                 st.markdown(f"- [{n['title']}]({n['url']}) · {n.get('source', '')} · {hora} UTC")
