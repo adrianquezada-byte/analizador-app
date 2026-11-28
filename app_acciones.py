@@ -1,4 +1,8 @@
 import datetime as dt
+import re
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -88,9 +92,9 @@ def market_cap(ticker: str, token: str):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def noticias_24h(ticker: str, token: str):
-    """Noticias de Tiingo de las últimas 24h (puede requerir plan con noticias)."""
-    desde = (dt.datetime.utcnow() - dt.timedelta(hours=24)).strftime("%Y-%m-%d")
+def noticias_tiingo(ticker: str, token: str):
+    """Noticias de Tiingo (requiere plan con noticias; si no, devuelve lista vacía)."""
+    desde = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).strftime("%Y-%m-%d")
     try:
         data = tiingo_get("/tiingo/news", token, {"tickers": ticker, "startDate": desde, "limit": 15})
         corte = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
@@ -102,6 +106,53 @@ def noticias_24h(ticker: str, token: str):
         return []
 
 
+def parsear_rss(contenido: bytes, horas: int = 24, limite: int = 15):
+    """Convierte el RSS de Google News en una lista de noticias de las últimas `horas` horas."""
+    corte = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=horas)
+    vistos, noticias = set(), []
+    for item in ET.fromstring(contenido).iter("item"):
+        titulo = (item.findtext("title") or "").strip()
+        fuente = (item.findtext("source") or "").strip()
+        try:
+            fecha = parsedate_to_datetime(item.findtext("pubDate"))
+            if fecha.tzinfo is None:
+                fecha = fecha.replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            continue
+        if fuente and titulo.endswith(f" - {fuente}"):
+            titulo = titulo[: -len(fuente) - 3]
+        clave = titulo.lower()
+        if not titulo or fecha < corte or clave in vistos:
+            continue
+        vistos.add(clave)
+        noticias.append({"title": titulo, "url": (item.findtext("link") or "").strip(), "source": fuente,
+                         "publishedDate": fecha.astimezone(dt.timezone.utc).isoformat(), "description": ""})
+    noticias.sort(key=lambda n: n["publishedDate"], reverse=True)
+    return noticias[:limite]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def noticias_google(ticker: str, nombre: str):
+    """Titulares de las últimas 24h desde Google News (RSS gratuito, sin clave)."""
+    limpio = re.sub(r"\b(and|inc|corp|corporation|company|co|ltd|plc|holdings|class [a-z])\b\.?,?", "", nombre, flags=re.I)
+    consulta = f"{' '.join(limpio.split())} {ticker} stock when:1d"
+    url = f"https://news.google.com/rss/search?q={quote_plus(consulta)}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        return parsear_rss(r.content)
+    except Exception:
+        return []
+
+
+def noticias_24h(ticker: str, nombre: str, token: str):
+    """Devuelve (noticias, fuente). Usa Tiingo si tu plan las incluye; si no, Google News."""
+    n = noticias_tiingo(ticker, token)
+    if n:
+        return n, "Tiingo"
+    return noticias_google(ticker, nombre), "Google News"
+
+
 # ---------- IA (OpenRouter) ----------
 def consultar_ia(api_key: str, prompt: str, modelo: str) -> str:
     r = requests.post(
@@ -110,31 +161,29 @@ def consultar_ia(api_key: str, prompt: str, modelo: str) -> str:
         json={"model": modelo, "messages": [{"role": "user", "content": prompt}]},
         timeout=90,
     )
+    if r.status_code == 402:
+        raise RuntimeError(
+            "OpenRouter respondió 402 (pago requerido): tu cuenta no tiene crédito suficiente. "
+            "Agrega saldo en openrouter.ai/settings/credits o usa un modelo gratuito (termina en :free) en la barra lateral."
+        )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list) -> str:
-    if noticias:
-        listado = "\n".join(
-            f"- {n['title']} ({n.get('source', '')}, {n['publishedDate'][:16]}): {(n.get('description') or '')[:300]}"
-            for n in noticias
-        )
-        prompt = (
-            f"Estas son las noticias de las últimas 24 horas sobre {nombre} ({ticker}):\n{listado}\n\n"
-            "Resume en español, en 4 a 6 viñetas, lo más relevante para un inversionista y "
-            "termina con una línea sobre el sentimiento general (positivo, neutral o negativo). "
-            "No inventes datos que no estén en la lista."
-        )
-        return consultar_ia(api_key, prompt, MODELO_IA)
-
-    # Sin noticias de Tiingo: se usa búsqueda web del modelo (sufijo :online)
-    prompt = (
-        f"Busca en la web las noticias e información relevante de las últimas 24 horas sobre {nombre} ({ticker}). "
-        "Resume en español, en 4 a 6 viñetas, lo más importante para un inversionista, indica la fuente "
-        "de cada punto y cierra con el sentimiento general. Si no hay noticias relevantes, dilo claramente."
+def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, modelo: str) -> str:
+    listado = "\n".join(
+        f"- {n['title']} ({n.get('source', '')}, {n['publishedDate'][:16].replace('T', ' ')} UTC)"
+        + (f": {n['description'][:300]}" if n.get("description") else "")
+        for n in noticias
     )
-    return consultar_ia(api_key, prompt, MODELO_IA + ":online")
+    prompt = (
+        f"Estos son los titulares de las últimas 24 horas sobre {nombre} ({ticker}):\n{listado}\n\n"
+        "Resume en español, en 4 a 6 viñetas, lo más relevante para un inversionista, agrupando titulares "
+        "que traten del mismo tema y mencionando la fuente entre paréntesis. Termina con una línea sobre el "
+        "sentimiento general (positivo, neutral o negativo). Básate solo en los titulares: no inventes cifras ni "
+        "detalles que no aparezcan en ellos y aclara cuando algo no esté claro."
+    )
+    return consultar_ia(api_key, prompt, modelo)
 
 
 # ---------- Medias móviles ----------
@@ -233,6 +282,11 @@ with st.sidebar:
     st.header("Configuración")
     tiingo_key = st.text_input("Tiingo API Key", type="password", value=secret("TIINGO_API_KEY"))
     openrouter_key = st.text_input("OpenRouter API Key", type="password", value=secret("OPENROUTER_API_KEY"))
+    modelo_ia = st.text_input(
+        "Modelo de IA (OpenRouter)",
+        value=MODELO_IA,
+        help="Para no gastar crédito prueba uno gratuito, por ejemplo: meta-llama/llama-3.3-70b-instruct:free",
+    ).strip()
     opcion = st.selectbox("Empresa", list(EMPRESAS) + [OTRO])
     if opcion == OTRO:
         ticker = st.text_input("Ticker personalizado", value="AAPL").strip().upper()
@@ -305,18 +359,26 @@ if analizar:
 
     st.divider()
     st.subheader("🗞️ Información relevante de las últimas 24 horas")
-    if not openrouter_key:
-        st.info("Ingresa tu OpenRouter API Key para ver el resumen de noticias con IA.")
+    with st.spinner("Buscando noticias..."):
+        noticias, fuente = noticias_24h(ticker, nombre, tiingo_key)
+
+    if not noticias:
+        st.info("No se encontraron noticias de las últimas 24 horas para esta acción.")
     else:
-        try:
-            with st.spinner("Analizando noticias con IA..."):
-                noticias = noticias_24h(ticker, tiingo_key)
-                st.markdown(resumen_noticias(openrouter_key, ticker, nombre, noticias))
-            if noticias:
-                with st.expander("Ver noticias originales"):
-                    for n in noticias:
-                        st.markdown(f"- [{n['title']}]({n['url']}) · {n.get('source', '')}")
-        except Exception as e:
-            st.error(f"No se pudo generar el resumen con IA: {e}")
+        resumen_ok = False
+        if openrouter_key:
+            try:
+                with st.spinner("Resumiendo con IA..."):
+                    st.markdown(resumen_noticias(openrouter_key, ticker, nombre, noticias, modelo_ia))
+                resumen_ok = True
+            except Exception as e:
+                st.error(f"No se pudo generar el resumen con IA: {e}")
+        else:
+            st.info("Ingresa tu OpenRouter API Key para ver un resumen con IA. Abajo tienes los titulares.")
+
+        with st.expander(f"Titulares de las últimas 24 horas ({fuente})", expanded=not resumen_ok):
+            for n in noticias:
+                hora = n["publishedDate"][:16].replace("T", " ")
+                st.markdown(f"- [{n['title']}]({n['url']}) · {n.get('source', '')} · {hora} UTC")
 
     st.caption("Información con fines informativos; no constituye asesoría financiera.")
