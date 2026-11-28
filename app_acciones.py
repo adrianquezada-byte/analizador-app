@@ -138,6 +138,7 @@ def parsear_rss(contenido: bytes, horas: int = 24, limite: int = 15):
 def noticias_google(ticker: str, nombre: str, horas: int = 24):
     """Titulares desde Google News (RSS gratuito). Devuelve (noticias, diagnóstico)."""
     limpio = re.sub(r"\b(and|inc|corp|corporation|company|co|ltd|plc|holdings|class [a-z])\b\.?,?", "", nombre, flags=re.I)
+    limpio = re.sub(r"(^|\s)[-–—]+(?=\s|$)", " ", limpio)
     limpio = " ".join(limpio.split())
     dias = max(1, round(horas / 24))
     consultas = [f"{limpio} {ticker} stock", limpio, f"{ticker} stock"]
@@ -209,7 +210,7 @@ def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, mod
 
 
 # ---------- Apertura: pre-market, futuros, resultados y estimación ----------
-ET = ZoneInfo("America/New_York")
+NY = ZoneInfo("America/New_York")  # zona horaria de Nueva York
 FINNHUB = "https://finnhub.io/api/v1"
 ETIQUETA_SESION = {
     "pre": "🌅 Pre-market (4:00–9:30 ET)",
@@ -240,7 +241,7 @@ def analizar_extendido(barras: pd.DataFrame, cierres: dict | None = None):
     if barras is None or barras.empty or "close" not in barras:
         return None
     b = barras.copy()
-    b["date"] = pd.to_datetime(b["date"], utc=True).dt.tz_convert(ET)
+    b["date"] = pd.to_datetime(b["date"], utc=True).dt.tz_convert(NY)
     b = b.sort_values("date")
     b = b[b["date"].dt.weekday < 5]
     minutos = b["date"].dt.hour * 60 + b["date"].dt.minute
@@ -390,7 +391,7 @@ def calendario_resultados(ticker: str, key: str):
 
 def seccion_apertura(ticker, tiingo_key, finnhub_key, hist, px):
     st.subheader("🌅 Apertura: pre-market, futuros y estimación")
-    ahora = dt.datetime.now(ET)
+    ahora = dt.datetime.now(NY)
     hoy = ahora.date()
     sesion = sesion_mercado(ahora)
     st.caption(f"{ETIQUETA_SESION[sesion]} · Hora en Nueva York: {ahora:%d/%m/%Y %H:%M}")
