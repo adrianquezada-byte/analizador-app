@@ -177,20 +177,36 @@ def noticias_24h(ticker: str, nombre: str, token: str):
 
 
 # ---------- IA (OpenRouter) ----------
+MODELO_GRATIS = "openrouter/free"  # enruta a un modelo gratuito disponible (no requiere crédito)
+
+
 def consultar_ia(api_key: str, prompt: str, modelo: str) -> str:
-    r = requests.post(
-        OPENROUTER,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": modelo, "messages": [{"role": "user", "content": prompt}]},
-        timeout=90,
-    )
+    def llamar(m: str):
+        return requests.post(
+            OPENROUTER,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": m, "messages": [{"role": "user", "content": prompt}]},
+            timeout=90,
+        )
+
+    r = llamar(modelo)
+    usado_gratis = False
+    # Sin crédito (402): reintenta automáticamente con un modelo gratuito
+    if r.status_code == 402 and modelo != MODELO_GRATIS and not modelo.endswith(":free"):
+        r = llamar(MODELO_GRATIS)
+        usado_gratis = True
     if r.status_code == 402:
         raise RuntimeError(
-            "OpenRouter respondió 402 (pago requerido): tu cuenta no tiene crédito suficiente. "
-            "Agrega saldo en openrouter.ai/settings/credits o usa un modelo gratuito (termina en :free) en la barra lateral."
+            "OpenRouter respondió 402 (pago requerido). Agrega saldo en openrouter.ai/settings/credits "
+            f"o usa el modelo gratuito «{MODELO_GRATIS}» en la barra lateral."
         )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    texto = (r.json()["choices"][0]["message"].get("content") or "").strip()
+    if not texto:
+        raise RuntimeError("El modelo no devolvió texto; prueba de nuevo o cambia de modelo.")
+    if usado_gratis:
+        texto += "\n\n_ℹ️ Resumen generado con un modelo gratuito porque tu cuenta de OpenRouter no tiene crédito._"
+    return texto
 
 
 def resumen_noticias(api_key: str, ticker: str, nombre: str, noticias: list, modelo: str, horas: int = 24) -> str:
@@ -622,7 +638,7 @@ with st.sidebar:
     modelo_ia = st.text_input(
         "Modelo de IA (OpenRouter)",
         value=MODELO_IA,
-        help="Para no gastar crédito prueba uno gratuito, por ejemplo: meta-llama/llama-3.3-70b-instruct:free",
+        help="Sin crédito en OpenRouter, usa openrouter/free (elige un modelo gratuito disponible). Si el modelo elegido da error 402, la app reintenta con ese automáticamente.",
     ).strip()
     opcion = st.selectbox("Empresa", list(EMPRESAS) + [OTRO])
     if opcion == OTRO:
