@@ -27,6 +27,8 @@ EMPRESAS = {
     "Broadcom (AVGO)": "AVGO",
     "Eli Lilly (LLY)": "LLY",
     "Berkshire Hathaway (BRK-B)": "BRK-B",
+    "SAP (SAP)": "SAP",
+    "Anthropic (ANT)": "ANT",
 }
 OTRO = "Otro ticker…"
 
